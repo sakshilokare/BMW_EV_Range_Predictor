@@ -1,0 +1,202 @@
+CELL 1:
+# BMW EV Range Predictor - Complete Project
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import requests
+import sys
+import os
+
+# Add config directory to path
+sys.path.append('.')
+
+try:
+    from config import OPENROUTESERVICE_API_KEY, BMW_I4_PARAMS, DEFAULT_ORIGIN, DEFAULT_DESTINATION
+    print("✅ Configuration loaded successfully!")
+except ImportError:
+    print("⚠️  Using default configuration")
+    OPENROUTESERVICE_API_KEY = "YOUR_API_KEY_HERE"
+    DEFAULT_ORIGIN = "Munich, Germany"
+    DEFAULT_DESTINATION = "Stuttgart, Germany"
+    
+print("🚗 BMW EV Range Predictor")
+print("=" * 50)
+
+## CELL 2: Route Data Function
+def get_coordinates_ors(address):
+    try:
+        url = "https://api.openrouteservice.org/geocode/search"
+        headers = {'Authorization': OPENROUTESERVICE_API_KEY}
+        params = {'text': address, 'size': 1}
+        response = requests.get(url, headers=headers, params=params)
+        
+        if response.status_code == 200:
+            data = response.json()
+            if data['features']:
+                coords = data['features'][0]['geometry']['coordinates']
+                print(f"📍 Geocoded: {address}")
+                return coords
+        return None
+    except Exception as e:
+        print(f"❌ Geocoding error: {e}")
+        return None
+
+def get_route_data():
+    try:
+        origin_coords = get_coordinates_ors(DEFAULT_ORIGIN)
+        destination_coords = get_coordinates_ors(DEFAULT_DESTINATION)
+        
+        if not origin_coords or not destination_coords:
+            return None
+        
+        url = "https://api.openrouteservice.org/v2/directions/driving-car"
+        headers = {'Authorization': OPENROUTESERVICE_API_KEY, 'Content-Type': 'application/json'}
+        body = {"coordinates": [origin_coords, destination_coords], "instructions": "false", "elevation": "true"}
+        
+        response = requests.post(url, json=body, headers=headers)
+        
+        if response.status_code == 200:
+            data = response.json()
+            route = data['routes'][0]
+            summary = route['summary']
+            
+            elevation_profile = []
+            for i in range(6):
+                distance = (i / 5) * (summary['distance'] / 1000)
+                if i < 3:
+                    elevation = 500 + (summary.get('ascent', 0) * 0.6 * (i/3))
+                else:
+                    elevation = 500 + (summary.get('ascent', 0) * 0.6) - (summary.get('descent', 0) * 0.6 * ((i-2)/3))
+                elevation_profile.append({'distance_km': distance, 'elevation_m': max(100, elevation)})
+            
+            return {
+                'start_address': DEFAULT_ORIGIN,
+                'end_address': DEFAULT_DESTINATION,
+                'distance_km': summary['distance'] / 1000,
+                'duration_min': summary['duration'] / 60,
+                'ascent_m': summary.get('ascent', 0),
+                'descent_m': summary.get('descent', 0),
+                'elevation_profile': elevation_profile,
+                'data_source': 'LIVE_API'
+            }
+        return None
+    except Exception as e:
+        print(f"❌ Route data error: {e}")
+        return None
+
+print("🌍 Getting route data...")
+route_data = get_route_data()
+
+if not route_data:
+    print("❌ Using fallback mock data")
+    route_data = {
+        'start_address': DEFAULT_ORIGIN,
+        'end_address': DEFAULT_DESTINATION,
+        'distance_km': 225.0,
+        'duration_min': 132.0,
+        'ascent_m': 350,
+        'descent_m': 280,
+        'elevation_profile': [
+            {'distance_km': 0, 'elevation_m': 519},
+            {'distance_km': 45, 'elevation_m': 550},
+            {'distance_km': 90, 'elevation_m': 480},
+            {'distance_km': 135, 'elevation_m': 520},
+            {'distance_km': 180, 'elevation_m': 350},
+            {'distance_km': 225, 'elevation_m': 245}
+        ],
+        'data_source': 'MOCK_DATA'
+    }
+
+print(f"✅ Route data loaded: {route_data['distance_km']:.1f} km")
+
+## CELL 3 :  Energy Calculator
+class BMWEnergyCalculator:
+    def __init__(self, vehicle_params):
+        self.params = vehicle_params
+        self.gravity = 9.81
+        
+    def calculate_energy_consumption(self, route_data, speed_kmh=100):
+        print(f"🚀 Calculating energy consumption at {speed_kmh} km/h...")
+        total_energy_kwh = 0
+        battery_levels = []
+        elevation_profile = route_data['elevation_profile']
+        
+        for i in range(1, len(elevation_profile)):
+            segment_energy = self._calculate_segment_energy(elevation_profile[i-1], elevation_profile[i], speed_kmh)
+            total_energy_kwh += segment_energy
+            battery_percent = max(0, 100 - (total_energy_kwh / self.params['battery_capacity']) * 100)
+            battery_levels.append({
+                'distance_km': elevation_profile[i]['distance_km'],
+                'battery_percent': battery_percent,
+                'energy_used_kwh': total_energy_kwh
+            })
+        return total_energy_kwh, battery_levels
+    
+    def _calculate_segment_energy(self, start_point, end_point, speed_kmh):
+        distance_km = end_point['distance_km'] - start_point['distance_km']
+        if distance_km <= 0: return 0
+        distance_m = distance_km * 1000
+        speed_ms = speed_kmh / 3.6
+        elevation_change = end_point['elevation_m'] - start_point['elevation_m']
+        gradient = elevation_change / distance_m if distance_m > 0 else 0
+        
+        F_drag = 0.5 * self.params['air_density'] * self.params['drag_coefficient'] * self.params['frontal_area'] * speed_ms**2
+        F_roll = self.params['vehicle_mass'] * self.gravity * self.params['rolling_resistance']
+        F_grade = self.params['vehicle_mass'] * self.gravity * np.sin(np.arctan(gradient))
+        total_force = F_drag + F_roll + F_grade
+        power_watts = total_force * speed_ms
+        time_hours = distance_km / speed_kmh
+        
+        if total_force > 0:
+            energy_kwh = (power_watts * time_hours) / 1000 / self.params['drivetrain_efficiency']
+        else:
+            regen_energy = abs(power_watts * time_hours) / 1000 * self.params['regenerative_braking_efficiency']
+            energy_kwh = -regen_energy
+        
+        auxiliary_energy = self.params['auxiliary_power'] * time_hours
+        energy_kwh += auxiliary_energy
+        return energy_kwh
+
+energy_calc = BMWEnergyCalculator(BMW_I4_PARAMS)
+total_energy, battery_levels = energy_calc.calculate_energy_consumption(route_data, speed_kmh=100)
+
+print(f"✅ Energy Calculation Complete!")
+print(f"⚡ Total Energy Required: {total_energy:.1f} kWh")
+print(f"🔋 Battery Used: {(total_energy / BMW_I4_PARAMS['battery_capacity'] * 100):.1f}%")
+
+## CELL 4: Visualization
+battery_df = pd.DataFrame(battery_levels)
+elevation_df = pd.DataFrame(route_data['elevation_profile'])
+
+fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(16, 12))
+
+# Battery Level
+ax1.plot(battery_df['distance_km'], battery_df['battery_percent'], 'g-', linewidth=3)
+ax1.fill_between(battery_df['distance_km'], battery_df['battery_percent'], alpha=0.3, color='green')
+ax1.set_xlabel('Distance (km)'); ax1.set_ylabel('Battery Level (%)')
+ax1.set_title('🔋 Battery Level Over Distance', fontweight='bold'); ax1.grid(True, alpha=0.3)
+
+# Elevation Profile
+ax2.plot(elevation_df['distance_km'], elevation_df['elevation_m'], 'b-', linewidth=2)
+ax2.fill_between(elevation_df['distance_km'], elevation_df['elevation_m'], alpha=0.3, color='blue')
+ax2.set_xlabel('Distance (km)'); ax2.set_ylabel('Elevation (m)')
+ax2.set_title('🏔️ Route Elevation Profile', fontweight='bold'); ax2.grid(True, alpha=0.3)
+
+# Energy Consumption
+ax3.plot(battery_df['distance_km'], battery_df['energy_used_kwh'], 'r-', linewidth=2)
+ax3.fill_between(battery_df['distance_km'], battery_df['energy_used_kwh'], alpha=0.3, color='red')
+ax3.set_xlabel('Distance (km)'); ax3.set_ylabel('Energy Used (kWh)')
+ax3.set_title('⚡ Cumulative Energy Consumption', fontweight='bold'); ax3.grid(True, alpha=0.3)
+
+# Summary
+ax4.text(0.5, 0.7, f'TRIP SUMMARY', ha='center', va='center', fontsize=20, fontweight='bold')
+ax4.text(0.5, 0.5, f'Distance: {route_data["distance_km"]:.1f} km\nEnergy: {total_energy:.1f} kWh\nEfficiency: {route_data["distance_km"]/total_energy:.1f} km/kWh', ha='center', va='center', fontsize=14)
+ax4.axis('off')
+
+plt.tight_layout()
+plt.show()
+
+print("🎉 BMW EV Range Prediction Complete! 🚗⚡")
+
