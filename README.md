@@ -15,9 +15,7 @@ A sophisticated electric vehicle range prediction system that calculates energy 
 - **Professional Architecture** - Modular, extensible code
 
 ## 🚀 Quick Start
+Run locally at: http://localhost:8888/notebooks/Downloads/BMW_EV_Range_Predictor_Mock%20.ipynb
 
-```bash
-# Clone repository
-git clone https:https://github.com/sakshilokare/BMW_EV_Range_Predictor.git
 
 
